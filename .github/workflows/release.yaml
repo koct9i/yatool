@@ -1,0 +1,146 @@
+name: Release
+
+run-name: Release ${{ github.run_id }}
+
+on:
+  push:
+    branches:
+      - "pain"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build ${{ matrix.binary.name }} for ${{ matrix.target.platform }}
+    runs-on: ${{ matrix.target.run_on }}
+    outputs:
+      version: ${{ steps.build.outputs.version }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        target:
+          - run_on: ubuntu-latest
+            platform: default-linux-x86_64
+          - run_on: ubuntu-latest
+            platform: default-linux-aarch64
+          # - run_on: macos-latest
+          #   platform: default-darwin-arm64
+          # ./ya make --target-platform=list
+        binary:
+          - name: ya-bin
+            path: devtools/ya/bin/
+          - name: test_tool
+            path: devtools/ya/test/programs/test_tool/bin/
+
+    concurrency:
+      group: ${{ matrix.target.platform }}-${{ matrix.binary.name }}
+
+    env:
+      target_platform: ${{ matrix.target.platform }}
+      binary_name: ${{ matrix.binary.name }}
+      binary_path: ${{ matrix.binary.path }}
+      ya_make_flags: "-T --no-emit-status --show-extra-progress --stat --build=release"
+      YA_CACHE_DIR: ${{ github.workspace }}/ya-cache
+
+    steps:
+      # https://github.com/actions/checkout
+      - name: Checkout sources
+        uses: actions/checkout@v7
+        with:
+          path: yatool
+          fetch-depth: 1
+
+      # https://github.com/actions/cache
+      - name: Restore build cache
+        id: restore-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.YA_CACHE_DIR }}
+          key: ya-cache-${{ matrix.target.platform }}-${{ matrix.binary.name }}-${{ github.run_id }}
+          restore-keys: |
+            ya-cache-${{ matrix.target.platform }}-${{ matrix.binary.name }}
+            ya-cache-${{ matrix.target.platform }}
+
+      - name: Cleanup build cache
+        id: cleanup-cache
+        run: |
+          pushd yatool
+          ./ya make $ya_make_flags --target-platform="$target_platform" --gc "$binary_path"
+
+      - name: Build
+        id: build
+        shell: bash
+        run: |
+          set -eux -o pipefail
+          pushd yatool
+          version=$(git show HEAD -s --date=format:%Y%m%d --pretty=v0.0.%cd-%h)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          tarball="${binary_name}-${target_platform}.tgz"
+          ./ya make $ya_make_flags --target-platform="$target_platform" --install=../bin "$binary_path"
+          popd
+          tar -cvz -f "$tarball" -C bin "$binary_name"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          sha256sum "$tarball" > "${tarball}.sha256sum"
+          cat "${tarball}.sha256sum"
+          echo "sha256sum=${tarball}.sha256sum" >> "$GITHUB_OUTPUT"
+
+      # https://github.com/actions/upload-artifact
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: "${{ env.binary_name }}-${{ matrix.target.platform }}-${{ steps.build.outputs.version }}"
+          path: |
+            ${{ steps.build.outputs.tarball }}
+            ${{ steps.build.outputs.sha256sum }}
+
+      # https://github.com/actions/cache
+      - name: Save build cache
+        id: save-cache
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.YA_CACHE_DIR }}
+          key: ${{ steps.restore-cache.outputs.cache-primary-key }}
+
+  release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      # https://github.com/actions/download-artifact
+      - name: Download artifacts from all builds
+        uses: actions/download-artifact@v8
+        with:
+          path: collected
+
+      - name: Show collected files
+        run: ls -R collected
+
+      - name: Build cumulative sha256sum
+        run: |
+          cat collected/*/*.sha256sum >sha256sum
+          sha256sum=$(sha256sum sha256sum)
+          printf '### `ya.release`\n```\n%s %s\n```\n' "${{ needs.build.outputs.version }}" "${sha256sum% *}" | tee -a $GITHUB_STEP_SUMMARY release.md
+
+      # https://github.com/softprops/action-gh-release
+      - name: Create Release and upload assets
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.build.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          make_latest: true
+          body_path: release.md
+          files: |
+            sha256sum
+            collected/**/**/*.tgz
+            collected/**/**/*.sha256sum
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
