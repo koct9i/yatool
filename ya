@@ -41,6 +41,25 @@ class YaBinDownloadError(Exception):
 
 REGISTRY_ENDPOINT = os.environ.get("YA_REGISTRY_ENDPOINT", "https://devtools-registry.s3.yandex.net")
 
+RELEASE_BASE_URL = os.environ.get("YA_RELEASE_BASE_URL", "https://github.com/koct9i/yatool/releases/download")
+RELEASE_SHA256, RELEASE = open(os.path.join(os.getenv('YA_SOURCE_ROOT', os.path.dirname(os.path.realpath(__file__))), "ya.release")).read().split()
+RELEASE_SHA256_URLS=[f"{RELEASE_BASE_URL}/{RELEASE}/sha256sum"]
+
+RELEASE_MAP = {
+    "data": {
+        "linux-aarch64": {
+            "urls": [
+                f"{RELEASE_BASE_URL}/{RELEASE}/ya-bin-linux-aarch64.tgz"
+            ]
+        },
+        "linux": {
+            "urls": [
+                f"{RELEASE_BASE_URL}/{RELEASE}/ya-bin-linux-amd64.tgz"
+            ]
+        }
+    }
+}
+
 # Please do not change this dict, it is updated automatically
 # Start of mapping
 PLATFORM_MAP = {
@@ -184,7 +203,7 @@ def _fetch(url, into):
     if token:
         request.add_header('Authorization', 'OAuth {}'.format(token))
 
-    md5 = hashlib.md5()
+    sha256 = hashlib.sha256()
     sys.stderr.write('Downloading %s ' % url)
     sys.stderr.flush()
     try:
@@ -203,24 +222,24 @@ def _fetch(url, into):
                 sys.stderr.write('.')
                 sys.stderr.flush()
                 if block:
-                    md5.update(block)
+                    sha256.update(block)
                     f.write(block)
                 else:
                     break
-        return md5.hexdigest()
+        return sha256.hexdigest()
 
     finally:
         sys.stderr.write('] ')
         sys.stderr.flush()
 
 
-def _atomic_fetch(url, into, md5):
+def _atomic_fetch(url, into, sha256):
     tmp_dest = into + '.' + uniq()
     try:
-        real_md5 = _fetch(url, tmp_dest)
-        if real_md5 != md5:
+        real_sha256 = _fetch(url, tmp_dest)
+        if real_sha256 != sha256:
             # Treat checksum mismatch as a network problem: it means the transfer was corrupted or truncated
-            raise YaBinDownloadError('MD5 mismatched: %s differs from %s' % (real_md5, md5))
+            raise YaBinDownloadError('SHA256 mismatched: %s differs from %s' % (real_sha256, sha256))
         os.rename(tmp_dest, into)
         sys.stderr.write('OK\n')
     except Exception as e:
@@ -253,13 +272,13 @@ def _extract(path, into):
     tar.close()
 
 
-def _get(urls, md5):
-    dest_path = os.path.join(TOOLS_DIR, md5[:HASH_PREFIX])
+def _get(urls, sha256):
+    dest_path = os.path.join(TOOLS_DIR, sha256[:HASH_PREFIX])
 
     if not os.path.exists(dest_path):
         for iter in range(RETRIES):
             try:
-                _atomic_fetch(urls[iter % len(urls)], dest_path, md5)
+                _atomic_fetch(urls[iter % len(urls)], dest_path, sha256)
                 break
             except Exception:
                 if iter + 1 == RETRIES:
@@ -270,14 +289,14 @@ def _get(urls, md5):
     return dest_path
 
 
-def _get_dir(urls, md5, ya_name):
-    dest_dir = os.path.join(TOOLS_DIR, md5[:HASH_PREFIX] + '_d')
+def _get_dir(urls, sha256, ya_name):
+    dest_dir = os.path.join(TOOLS_DIR, sha256[:HASH_PREFIX] + '_d')
 
     if os.path.isfile(os.path.join(dest_dir, ya_name)):
         return dest_dir
 
     try:
-        packed_path = _get(urls, md5)
+        packed_path = _get(urls, sha256)
     except Exception:
         if os.path.isfile(os.path.join(dest_dir, ya_name)):
             return dest_dir
@@ -324,7 +343,7 @@ def main():
 
     result_args = sys.argv[1:]
 
-    meta = PLATFORM_MAP['data']
+    meta = RELEASE_MAP['data']
     my_platform = platform.system().lower()
     my_machine = platform.machine().lower()
     if my_platform == 'linux':
@@ -348,8 +367,11 @@ def main():
     best_key = max(meta.keys(), key=_platform_key(my_platform))
     value = meta[best_key]
 
+    release_sha256_path = _get(RELEASE_SHA256_URLS, RELEASE_SHA256)
+    file_sha256 = dict([l.split(maxsplit=2)[::-1] for l in open(release_sha256_path)])[value['urls'][0].split('/')[-1]]
+
     ya_name = {'win32': 'ya-bin.exe', 'win32-clang-cl': 'ya-bin.exe'}.get(best_key, 'ya-bin')  # XXX
-    ya_dir = _get_dir(value['urls'], value['md5'], ya_name)
+    ya_dir = _get_dir(value['urls'], file_sha256, ya_name)
     add_stage_start_to_environ('ya-script-prepare')
 
     # Popen `args` must have `str` type
